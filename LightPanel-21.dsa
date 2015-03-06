@@ -1,0 +1,1896 @@
+// DAZ Studio version 3.1  filetype DAZ Script
+
+/**********************************************************************
+Lighting Panel  script
+
+    From a request presented in the Script Forum for controlling the light intensities of several lights in a scene. Got a bit out of control :-)
+    So is now a pane for managing all the scene lights:
+     -  See all lights in scene and all their parameters (concisely as possible)
+     - Grouped by Tab (N lights to a tab) - sorted
+     - Allow user to edit all parameters of each light
+     - Allow user to adjust intensity of a group of lights at same time
+     - Included guandalug's idea for shadow control (toggle shadows on/off but remember the settings)
+           ( Helps with setting up renders when you have complex light scene. User can temporarily disable the shadows on al lights
+              http://www.ketnar.org/~guandalug/DAZFreebies/   )
+     - View Button allows users to see scene from Lights POV
+     - Highlight (Garish) color can be temporarily applied to a light
+           ( Useful to see what effect a specific light is having when setting up several lights in a scene )
+     - Add set color for group, set shadow type for group
+
+	 
+ Future:
+     IWBNI we could:
+      - sort lights on next open into diff categories. (e.g. by light type, shadowed, intensity - primary and secondary keys)
+           find and group mood-master and light-dome lights ( look for very similar lights)
+      - user chooses how many to a Tab (I.e. size of entire Dialog) - need registry persistence for next run.
+      - add minimum coverage for known shader lights - Uberlights, Pendragon's
+      More Difficult or less important:
+      - add Point-at selection
+      - indicate if there were any animation keys on the light
+      - for shaderlights check for supported params and do a layout..
+   
+-------------------------------------------------------------------------------
+Aside:	 Types of Lights and parameters to adjust:
+	 All native Lights have this in common (same as DistantLight):
+	      shadow Type (Deep shodow map or raytraced)
+	      shadow Softness - %,  shadow bias - %,   Color - RGB,   Intensity - % 
+	      Illumination type (Diffuse or specular only, or all on/off)
+	 Extra Factors:
+	       Spotlight 	- Shadow Softness - %,   Spread angle - %
+	      
+
+Author:  Neon22
+Date:    April 2010 (initially for DazStudio 1.4 Nov 2006)
+Version for:  DazStudio 3.0
+	      
+*******************************************************/
+
+
+var MIN_VERSION = "3.0";
+var g_sTOOL_KEY = "LightPanel";
+var g_sTOOL_NAME = "Light Panel"; // used in acceptUndo at very end
+
+//-------------------------------------------------------------------------------
+// User adjustable Globals
+
+// How many lights per tab in the Dialog (user adjustable when running)
+var maxLightsPerTab = 4;
+// Global New Color widget for pushing into all lights in a Group
+var wNewcolor;
+var NewColorDefault = new Color( 225, 224, 187 );  //R,G,B - light yellow (straw)
+
+var colorPropertyAliases = ["Color", "color", "Light Color", "Tint"];
+var intensityPropertyAliases = ["Intensity", "intensity"];
+
+//-------------------------------------------------------------------------------
+// Globals
+var nMARGIN = 5;
+var nSPACING = 5;
+var nMIN_BTN_WIDTH = 50;
+var nMAX_BTN_HEIGHT = 20;
+
+// Get the Help Manager for "What's This?" and tool tips
+var oHelpMgr = App.getHelpMgr();
+// find the "What's This?" action for the help button
+var oActionMgr = MainWindow.getActionMgr();
+var oHelpAction = oActionMgr ? oActionMgr.findAction( "DzWhatsThisAction" ) : undefined;
+
+// used to store the UI for each light - so we can update them when we scale or toggle them all
+var guiElements = new Array();
+var aLights = new Array();  // The array of all lights
+// remember our Lights so we can cancel
+var originalLightdata = new Array();
+// the viewport in focus
+var oViewPort = MainWindow.getViewportMgr().getActiveViewport().get3DViewport();
+// camera list and principle viewpoint
+var cameras = new Array();
+var sPrincipleCamera;
+var wPrincipleCameraToggle; // state of toggle button for Principle camera
+
+// vars for global settings panel
+var wIntensityScaleSlider;
+var aActiveLights = new Array();  // list of lights to globally affect as a Group
+var bIgnoreChange = false;  // used to stop changes changing themselves in global intensity and visibility
+
+// Group names are limited to Main and group2-7
+//    (because its hard to make this dynamic and name your own groups etc.. :-( )
+var wGroupSize;  // shows how many lights there are in a Group.
+var wGroupComboBox = 0; // selects the Current group (defaults to "All"=0)
+var groupNames = [ "Main", "Group-2", "Group-3", "Group-4", "Group-5", "Group-6", "Group-7" ];
+var lastGroup = -1; // used to store changed slider values when selecting new group
+
+// Global visibility radioButtons
+var wBtn1, wBtn2;
+// Global shadowtype radioButtons
+var wBtn3, wBtn4;
+
+// Want a sequence of garish (high saturation colors) to make it easy to identify lights in a scene
+var garishColors = [ "#F00", "#F0F", "#00F", "#0FF", "#0F0", "#FF0" ]; // feel free to add more
+var garishCount = -1;
+function getNewIDColor()   {
+	// IWBNI scene already has some loaded - then should detect the right number to continue from
+	garishCount += 1;  //but for now start from 0 each time
+	if( garishCount >= garishColors.length )  	{
+		garishCount = 0;
+	}
+	return ( garishColors[ garishCount ] );
+}
+
+//-------------------------------------------------------------------------------
+// Save and retrieve our App global settings
+// Get the App settings manager for persistent var storage
+// I.e. number of lights per tab,
+var g_sKEEP_LIGHTS_PER_TAB = "LP_LightsPerTab";
+var m_oMgr = App.getAppSettingsMgr();
+
+function set_persistent_vars( state ) { // set_persistent_vars(maxLightsPerTab);
+	m_oMgr.pushPath( g_sTOOL_KEY ); 
+	m_oMgr.setFloatValue( g_sKEEP_LIGHTS_PER_TAB, state + 1 );
+	m_oMgr.popPath();
+}
+
+function get_persistent_vars() {
+	m_oMgr.pushPath( g_sTOOL_KEY );
+	// assume last value is used if not found in registry
+	maxLightsPerTab = m_oMgr.getFloatValue( g_sKEEP_LIGHTS_PER_TAB, maxLightsPerTab );
+	m_oMgr.popPath();
+}
+
+//-------------------------------------------------------------------------------
+// tidy up the classnames of lights for printing
+function sTrimLightName( DZLight, rtrim ) {
+	var Ltype = DZLight.className();
+	Ltype = Ltype.right( Ltype.length - 2 ); // remove first two letters "Dz"
+	if( rtrim > 0 ) 	{
+		Ltype = Ltype.left( Ltype.length - rtrim ); // remove stuff at end (probably the word Light) 
+	}
+	return Ltype;
+}
+
+//
+// Helper functions defined outside of class to deal with default and shader based light implementations
+function LP_getIntensity( light ) {
+	if( light.inherits( "DzDistantLight" ) ) 	{ // standard DAZ light
+		return light.getIntensity();
+	}
+	else { // shader based light
+		var intensity = 1.0;
+		var prop;
+		try {
+			intensity = light.getIntensityControl().getValue() }
+		catch (e) {
+			debug("LP_getIntensity: unknown Light type" + e);
+			for( var i = 0; i < intensityPropertyAliases.length; i++ ) {
+				prop = light.findPropertyByLabel( intensityPropertyAliases[ i ] );
+				if (prop) {
+				intensity = prop.getValue()  }
+		}}
+		return(intensity)
+	}
+}
+
+function LP_setIntensity( light, value ) {
+	if( light.inherits( "DzDistantLight" ) ) 	{ // standard DAZ light
+		light.getIntensityControl().setValue( value );
+	}
+	else { // shader based light
+		var prop;
+		try {
+			light.getIntensityControl().setValue( value ); }
+		catch (e) {
+			debug("LP_setIntensity: unknown Light type" + e);
+			for( var i = 0; i < intensityPropertyAliases.length; i++ ) {
+				prop = light.findPropertyByLabel( intensityPropertyAliases[ i ] );
+				if (prop) {
+				prop.setValue( value )  }
+		}}
+	}
+}
+// this.thisLight.getIntensityControl().setValue( nValue );
+
+function LP_getIlluminationControl( light ) {
+	illum = -1;
+	if( light.inherits( "DzDistantLight" ) ) 	{
+		illum = light.getIlluminationControl().getValue();
+	}
+	else {
+		if( light.findProperty( "Illumination" ) ) 		{
+			//MessageBox.critical("read Illum =  "+light.findProperty("Illumination").getValue(), "LP debug","Ok");
+			illum = light.findProperty( "Illumination" ).getValue();
+		} }
+	return ( illum );
+}
+
+function LP_setIlluminationControl( light, newvalue ) {
+	if( light.inherits( "DzDistantLight" ) )	{
+		light.getIlluminationControl().setValue( newvalue );
+	}
+	else {
+		//MessageBox.critical("write Illum =  "+newValue+" "+light.findProperty("Illumination").getValue(), "LP debug","Ok");
+		light.findProperty( "Illumination" ).setValue( newvalue );
+	}
+}
+
+function LP_getShadowType( light ) {
+	shad_type = -1;
+	// add checks in here to send -1 for lights that do not have this ability.
+  // e.g. Pendragon's ILT and UberSpot cannot do maps
+	shad_type = light.getShadowType();
+	return ( shad_type );
+}
+
+function LP_setColor( light, newcolor ) {
+	if( light.inherits( "DzDistantLight" ) ) 	{ // standard DAZ light
+		light.getDiffuseColorControl().setColorValue( newcolor );
+	}
+	else {  // shader based light
+		var prop;
+		try {
+			light.getColorControl().setColorValue( newcolor ) }
+		catch (e) {
+			debug("LP_setColor: unknown Light type" + e);
+			for( var i = 0; i < colorPropertyAliases.length; i++ ) {
+				prop = light.findPropertyByLabel( colorPropertyAliases[ i ] );
+				if (prop) {
+				prop.setColorValue( newcolor )  }
+			}
+	}}
+}
+
+function LP_getColor( light ) {
+	if( light.inherits( "DzDistantLight" ) ) 	{ // standard DAZ light
+		return(light.getDiffuseColorControl().getColorValue())	}
+	else {  // shader based light
+		var color = new Color(0,0,0);
+		var prop;
+		try {
+			color = light.getColorControl().getColorValue() }
+		catch (e) {
+			debug("LP_getColor: unknown Light type" + e);
+			for( var i = 0; i < colorPropertyAliases.length; i++ ) {
+				prop = light.findPropertyByLabel( colorPropertyAliases[ i ] );
+				if (prop) {
+				color = prop.getColorValue()  }
+		}}
+		return(color)
+	}
+}
+
+// Look for properties and try to guess the type of Shader
+//  I.e. is it a UberLight or an ILT
+// Use this info to show appropriate parameters in GUI
+function identifyLightShader( light ) {
+	lightType = -1;
+	if( light.findProperty( "Irradiance Shadingrate" ) != -1 ) 	{
+		if( light.findProperty( "IBL Map Saturation" ) != -1 ) 	{
+			lightType = "PendragonIBL";
+		}
+		else
+		lightType = "PendragonILT";
+	}
+	if( light.findProperty( "Cone Softness" ) && light.findProperty( "Falloff Active" ) ) 	{
+		lightType = "UberSpot";
+	}
+	return ( lightType );
+}
+
+/***********************************************************************
+***** LightComponent Prototype *****
+***********************************************************************/
+// Class to display attributes of a single light of any kind
+// Takes a light and a parent and creates itself in that parent
+
+function LightComponent( oLight, parent )
+{
+	// Instance Members
+	this.thisLight;
+	this.shadowType;
+	this.shadowBias;
+	this.shadowSoftness;
+	this.lightType;
+	this.lightIntensity;
+	this.lightDiffuse;
+	this.lightSpread;
+	// extra vars
+	this.nOrigIntensity; // remember original intensity so incremental scaling calculates from this original.
+	this.pointAt; // is this light pointing at something
+	
+	// layout widgets
+	this.wLightTopHBox;  // top level H group
+	this.wStateVBox;     // LHS under wLightTopHBox 
+	this.wTypeHBox;      // sub box under StateVBox
+	this.wHilightHBox;   // sub box under StateVBox
+	this.wLightVBox;     // RHS under wLightTopHBox  
+	this.wShadowHBox;    // RHS under wLightTopHBox 
+	this.wLightVisOnOff; // DzCheckBox under wStateVBox
+	this.wlookButton;    // DzCheckBox under wStateVBox (look at the scene from light's perspective)
+	this.wIDcolor;       // DzColorWgt  under wStateVBox (identity color)
+	this.wActivateHilight;    // turn on garish light or proper color
+	this.wLightTypeComboBox;  // DzComboBox under wStateVBox
+	this.wLightColorHBox;     // Group for Light color, intensity, spread
+	this.wLightColor;         // DzColorWgt  under  wLightColorHBox
+	this.wIntensitySlider;    // DzFloatSlider  under  wLightColorHBox
+	this.wSpreadSlider;       // DzFloatSlider  under  wLightColorHBox
+	this.wShadowTypeComboBox; // DzComboBox under wShadowHBox
+	this.wSoftSlider;         // DzFloatSlider  under wShadowHBox
+	this.wBiasSlider;         // DzFloatSlider  under  wShadowHBox
+	this.wNamedColComboBox;   // DzComboBox under ...
+
+  // Constructor to build GUI element per light
+	this.thisLight = oLight;
+	// remember original intensity (for scaling groups of lights dynamically)
+	this.nOrigIntensity = LP_getIntensity( this.thisLight );
+	// Layout the Boxes
+	// organise into two Horizontal groups with Slider controls on the right
+	this.wLightTopHBox = new DzHGroupBox( parent );
+	this.wLightTopHBox.title = this.thisLight.getLabel();
+	this.wLightTopHBox.insideMargin = 4;
+	this.wLightTopHBox.insideSpacing = 2;
+	//
+	// Left hand side VBox for on/off, Type etc
+	this.wStateVBox = new DzVGroupBox( this.wLightTopHBox );
+	this.wStateVBox.insideMargin = 2;
+	this.wStateVBox.insideSpacing = 2;
+	this.wStateVBox.maxWidth = 151;
+	// subgroup for diffuse/spec and visible
+	this.wTypeHBox = new DzHGroupBox( this.wStateVBox );
+	this.wTypeHBox.insideMargin = 2;
+	this.wTypeHBox.insideSpacing = 0;
+	this.wTypeHBox.flat = true;
+	// subgroup for View-from and garish color
+	this.wHilightHBox = new DzHGroupBox( this.wStateVBox );
+	this.wHilightHBox.insideMargin = 2;
+	this.wHilightHBox.insideSpacing = 0;
+	this.wHilightHBox.flat = true;
+	// subgroup for named collections
+	wCollectionHBox = new DzHGroupBox( this.wStateVBox );
+	wCollectionHBox.insideMargin = 2;
+	wCollectionHBox.insideSpacing = 0;
+	wCollectionHBox.flat = true;
+	// subgroup for Point At objects (not implemented yet)
+  //	wPointAtHBox = new DzHGroupBox( wStateVBox );
+  //	wPointAtHBox.insideMargin = 0;
+  //	wPointAtHBox.insideSpacing = 0;
+  //	wPointAtHBox.flat = true;
+	//
+	// Right Hand side for the Light settings (colour, shadows)
+	this.wLightVBox = new DzVGroupBox( this.wLightTopHBox );
+	this.wLightVBox.title = ""; // will be filled in dynamically
+	this.wLightVBox.insideMargin = 2;
+	this.wLightVBox.insideSpacing = 0;
+	// Group for Color, Intensity..
+	this.wLightColorHBox = new DzHGroupBox( this.wLightVBox );
+	this.wLightColorHBox.insideMargin = 2;
+	this.wLightColorHBox.insideSpacing = 2;
+	this.wLightColorHBox.flat = true;
+	// Group for Shadows
+	this.wShadowHBox = new DzHGroupBox( this.wLightVBox );
+	this.wShadowHBox.title = "";
+	this.wShadowHBox.insideMargin = 0;
+	this.wShadowHBox.insideSpacing = 2;
+	this.wShadowHBox.flat = true;
+	//  All laid out - Now fill it all in.
+	// 
+	// Create Light Type combo box
+	this.lightType = LP_getIlluminationControl( this.thisLight );
+	if( this.lightType != -1 )
+	{
+		this.wLightTypeComboBox = new DzComboBox( this.wTypeHBox );
+		this.wLightTypeComboBox.setFixedWidth( 80 );
+		this.wLightTypeComboBox.insertItem( "Off" );
+		this.wLightTypeComboBox.insertItem( "Diffuse only" );
+		this.wLightTypeComboBox.insertItem( "Specular only" );
+		this.wLightTypeComboBox.insertItem( "On" );
+		this.wLightTypeComboBox.currentItem = this.lightType;
+		this.wLightTypeComboBox.toolTip = "Active in Render and what type of lighting";
+		this.wLightTypeComboBox.whatsThis = "What kind of light (diffuse/specular/both) does it represent on the surfaces it hits";
+		connect( this.wLightTypeComboBox, "activated(int)", this, "setLightType" ); // function to call when user interacts
+	}
+	// display light visibility  On/Off 
+	this.wLightVisOnOff = new DzCheckBox( this.wTypeHBox );
+	this.wLightVisOnOff.checked = this.thisLight.isVisible();
+	this.wLightVisOnOff.setFixedWidth( 54 );
+	this.wLightVisOnOff.text = this.constructVisibleString();
+	this.wLightVisOnOff.toolTip = "Visible in scene?";
+	this.wLightVisOnOff.whatsThis = "Is this light visible in the Scene";
+	connect( this.wLightVisOnOff, "toggled(bool)", this, "turnOnOff" ); // function to call when user interacts
+	// 
+	// Look from light's POV
+	this.wlookButton = new DzPushButton( this.wHilightHBox );
+	this.wlookButton.text = "View";
+	this.wlookButton.setFixedWidth( 38 );
+	this.wlookButton.toolTip = "See what the light sees";
+	this.wlookButton.whatsThis = "Change current POV to see what this light sees";
+	connect( this.wlookButton, "pressed()", this, "lookFrom" ); // function to call when user interacts
+	//
+	// the identity color
+	this.wIDcolor = new DzColorWgt( this.wHilightHBox );
+	this.wIDcolor.setFixedWidth( 80 );
+	this.wIDcolor.toolTip = "Bright Identification color (standin)";
+	this.wIDcolor.whatsThis = "A Garish color to make it easy to spot how this light is contributing to scene illumination";
+	connect( this.wIDcolor, "colorChanged(const QColor&)", this, "setIDColor" ); // function to call when user interacts
+	//
+	// Garish Highlight
+	this.wActivateHilight = new DzCheckBox( this.wHilightHBox );
+	if( this.thisLight.findProperty( "LP_IDon" ) ) 	{// means we had a hilight toggled on in last session
+		this.wActivateHilight.checked = true;
+		// if id is on then proper color is stored in property and ID color is main color now
+		this.wIDcolor.value = this.thisLight.findProperty( "LP_idColor" ).getColorValue();
+	}
+	else {
+		this.wActivateHilight.checked = false;
+		if( this.thisLight.findProperty( "LP_idColor" ) ) {
+			this.wIDcolor.value = this.thisLight.findProperty( "LP_idColor" ).getColorValue();
+			garishCount += 1;
+		}
+		else { // no ID color defined - go get one
+			var c = new Color( getNewIDColor() );
+			this.setIDColor( c );
+			this.wIDcolor.value = c;
+		}
+	}
+	this.wActivateHilight.setFixedWidth( 14 );
+	this.wActivateHilight.toolTip = "Toggle this ID color for Light Color";
+	this.wActivateHilight.whatsThis = "Make the light this Garish ID color. (Remember actual color. Toggle to swap)";
+	connect( this.wActivateHilight, "toggled(bool)", this, "swapIDColor" ); // function to call when user interacts
+	//
+	// create the Named collections
+	var wNamedCol = new DzLabel( wCollectionHBox );
+	wNamedCol.text = "Group:";
+	wNamedCol.setFixedWidth( 35 );
+	this.wNamedColComboBox = new DzComboBox( wCollectionHBox );
+	this.wNamedColComboBox.setFixedWidth( 108 );
+	this.addGroups( this.wNamedColComboBox ); // build the items in the ComboBox
+	var existingGroup = this.thisLight.findProperty( "LP_groupid" );
+	if( !existingGroup ) {  // if not already allocated a group - add this light to "Main"
+		this.setGroup( 0 );
+		existingGroup = this.thisLight.findProperty( "LP_groupid" );
+	}
+	this.wNamedColComboBox.currentItem = existingGroup.getValue();
+	this.wNamedColComboBox.toolTip = "Unique Group this light is in";
+	this.wNamedColComboBox.whatsThis = "So you can manipulate aspects of a group of lights";
+	connect( this.wNamedColComboBox, "activated(int)", this, "setGroup" ); // function to call when user interacts
+	//
+	// create the Point_At section
+	//  - might be coming back if we can work out how to select an object more easily than making a complete list for every light
+//	wPointAtLabel1 = new DzLabel( wPointAtHBox );
+//	wPointAtLabel1.setFixedWidth(48);
+//	wPointAtLabel1.text = " Point at:";
+//	wPointAtLabel2 = new DzLabel( wPointAtHBox );
+//	wPointAtLabel2.alignment = AlignLeft;
+//	wPointAtLabel2.text = "None";
+//	wPointAtLabel2.toolTip = "Object this Light is pointing at";
+//	wPointAtLabel2.whatsThis = "So you can aim a light dynamically at another object in the scene";	
+	//
+	// Create the color widget
+	//this.lightDiffuse = this.thisLight.getDiffuseColor();
+	//this.lightDiffuse = this.getColorVal();	
+	this.wLightColor = new DzColorWgt( this.wLightColorHBox );
+	this.wLightColor.value = LP_getColor(this.thisLight);//lightDiffuse;
+	this.wLightColor.setFixedWidth( 80 );
+	this.wLightColor.toolTip = "Light Color";
+	this.wLightColor.whatsThis = "The principle color of the Light";
+	if( this.lightType == 0 )  	{
+		this.wLightColor.enabled = false;
+	}
+	connect( this.wLightColor, "colorChanged(const QColor&)", this, "setColorVal" );  // function to call when user interacts
+	//
+	// Create Light Intensity slider
+	this.lightIntensity = LP_getIntensity( this.thisLight );
+	this.wIntensitySlider = new DzFloatSlider( this.wLightColorHBox );
+	this.wIntensitySlider.label = "Intensity";
+	this.wIntensitySlider.labelVisible = true;
+	this.wIntensitySlider.min = 0;
+	this.wIntensitySlider.max = 2;
+	this.wIntensitySlider.clamped = true;
+	this.wIntensitySlider.sensitivity = 0.1;
+	this.wIntensitySlider.value = this.lightIntensity;
+	this.wIntensitySlider.textEditable = true;
+	this.wIntensitySlider.textVisible = true;
+	this.wIntensitySlider.minWidth = 80;
+	this.wIntensitySlider.displayAsPercent = true;
+	this.wIntensitySlider.toolTip = "Light Intensity";
+	this.wIntensitySlider.whatsThis = "Intensity can vary from 0 (dark) to 200 %. 100% is the default";
+	if( this.lightType == 0 ) {
+		this.wIntensitySlider.enabled = false;
+	}
+	connect( this.wIntensitySlider, "valueChanged(float)", this, "setIntensityVal" ); // function to call when user interacts
+	//
+	// Create Spread Angle slider for Spotlights
+	if( this.thisLight.className() == "DzSpotLight" ) {
+		this.lightSpread = this.thisLight.getSpreadAngleControl().getValue();
+		this.wSpreadSlider = new DzFloatSlider( this.wLightColorHBox );
+		this.wSpreadSlider.label = "Spread";
+		this.wSpreadSlider.labelVisible = true;
+		this.wSpreadSlider.min = 0;
+		this.wSpreadSlider.max = 180;
+		this.wSpreadSlider.clamped = true;
+		this.wSpreadSlider.sensitivity = 2;
+		this.wSpreadSlider.value = this.lightSpread;
+		this.wSpreadSlider.textEditable = true;
+		this.wSpreadSlider.textVisible = true;
+		this.wSpreadSlider.minWidth = 80;
+		this.wSpreadSlider.toolTip = "Spread Angle";
+		this.wSpreadSlider.whatsThis = "The Angle of the Cone of light leaving the light.";
+		if( this.lightType == 0 ) {
+			this.wSpreadSlider.enabled = false;
+		}
+		connect( this.wSpreadSlider, "valueChanged(float)", this, "setSpreadAngle" ); // function to call when user interacts
+	}
+	//
+	// Shadow Settings   (Group shadow type,  %,  and bias )
+	// Create Shadow Type combo box
+	this.shadowType = LP_getShadowType( this.thisLight );
+	if( this.shadowType != -1 ) {
+		this.wShadowTypeComboBox = new DzComboBox( this.wShadowHBox );
+		this.wShadowTypeComboBox.setFixedWidth( 50 );
+		this.wShadowTypeComboBox.insertItem( "Off" );
+		this.wShadowTypeComboBox.insertItem( "Map" );
+		this.wShadowTypeComboBox.insertItem( "Ray" );
+		this.wShadowTypeComboBox.currentItem = this.shadowType;
+		this.wShadowTypeComboBox.toolTip = "Shadow off, or rendered shadow map (speed), or raytrace (quality)";
+		this.wShadowTypeComboBox.whatsThis = "Shadow can be None, or Deep Shadow Map or Software Raytrace";
+		connect( this.wShadowTypeComboBox, "activated(int)", this, "setShadowType" );
+		 // function to call when user interacts
+	}
+	//		
+	// Create Shadow Softness slider
+	if( this.thisLight.inherits( "DzDistantLight" ) ) {
+		softShadow = this.thisLight.getShadowSoftnessControl().getValue();
+		this.wSoftSlider = new DzFloatSlider( this.wShadowHBox );
+		this.wSoftSlider.label = "Soft";
+		this.wSoftSlider.labelVisible = true;
+		this.wSoftSlider.min = 0;
+		this.wSoftSlider.max = 1;
+		this.wSoftSlider.clamped = true;
+		this.wSoftSlider.sensitivity = 0.05;
+		this.wSoftSlider.value = softShadow;
+		this.wSoftSlider.textEditable = true;
+		this.wSoftSlider.textVisible = true;
+		this.wSoftSlider.minWidth = 110;
+		this.wSoftSlider.displayAsPercent = true;
+		this.wSoftSlider.toolTip = "Shadow %";
+		this.wSoftSlider.whatsThis = "Shadow Softness 0(hard) to 100%.  Default is hard edge.  (0%)";
+		if( ( this.lightType == 0 ) || ( this.shadowType == 0 ) ) {
+			this.wSoftSlider.enabled = false;
+		}
+		connect( this.wSoftSlider, "valueChanged(float)", this, "setSoftVal" ); // function to call when user interacts
+	}
+	//
+	// Create Shadow Bias slider
+	if( this.thisLight.inherits( "DzDistantLight" ) ) {
+		this.shadowBias = this.thisLight.getShadowBiasControl().getValue();
+		this.wBiasSlider = new DzFloatSlider( this.wShadowHBox );
+		this.wBiasSlider.label = "Bias";
+		this.wBiasSlider.labelVisible = true;
+		this.wBiasSlider.min = 0;
+		this.wBiasSlider.max = 10;
+		this.wBiasSlider.clamped = true;
+		this.wBiasSlider.sensitivity = 0.5;
+		this.wBiasSlider.value = this.shadowBias;
+		this.wBiasSlider.textEditable = true;
+		this.wBiasSlider.textVisible = true;
+		this.wBiasSlider.minWidth = 110;
+		this.wBiasSlider.toolTip = "Shadow Bias";
+		this.wBiasSlider.whatsThis = "Shadow Bias is a small distance offset (typically 1.0) to account for surfaces being too close to resolve.";
+		if( ( this.lightType == 0 ) || ( this.shadowType == 0 ) ) { // I.e. None chosen. Shadow not active
+			this.wBiasSlider.enabled = false;
+		}
+		connect( this.wBiasSlider, "valueChanged(float)", this, "setBiasVal" ); // function to call when user interacts
+	}
+	// update Titles to reflect info we know about the light.
+	this.wLightTopHBox.title = this.constructStatusString();
+	this.wShadowHBox.title = this.constructShadowString();
+	//
+	// Next...?
+} //end of LightComponent
+
+/***********************************************************************/
+LightComponent.superclass = Object;
+
+
+/*********************************************************************/
+// Internal functions used by this class
+
+// Give the user some top level info about what's happening with this light
+LightComponent.prototype.constructStatusString = function() {
+	// Name, on/Off,  type, shadow on/off, pointing at:
+	var message, sLightType = "", sLightClass, sShadowstatus;
+	var sPointAtWhat, oPointAtNode;
+	message = this.thisLight.getLabel(); // Start with Lights Name
+	message += "        ";
+	// get diffue/spec only flags
+	eLightType = LP_getIlluminationControl( this.thisLight );
+	if( eLightType == 1 ) 	{
+		eLightType = "Diffuse-only  ";	}
+	else {
+		if( eLightType == 2 ) 	{
+			eLightType = "Specular-only  "; 	}
+		else {
+			eLightType = ""; 	} }
+  // get type of light
+	sLightClass = sTrimLightName( this.thisLight );
+	// get shadow status
+	sShadowstatus = ( LP_getShadowType( this.thisLight ) > 0 ) ? "  with Shadow" : "       (no shadow)";
+	// Are we pointing at anything ?
+	oPointAtNode = this.thisLight.getPointAtControl().getNode();
+	sPointAtWhat = oPointAtNode ? "   Pointing at: " + oPointAtNode.getLabel() : "";
+	// Check for visibility and shadow only state
+	if( LP_getIlluminationControl( this.thisLight ) == 0 )	{ //  turned off 
+		message += "Off  ("; 	}
+	message += "a " + eLightType + sLightClass + sShadowstatus + sPointAtWhat;
+	if( LP_getIlluminationControl( this.thisLight ) == 0 ) {
+		message += ")"; 	}
+  //
+	return message;
+}
+
+/*********************************************************************/
+// mesage for checkbox
+LightComponent.prototype.constructVisibleString = function() {
+	return ( this.thisLight.isVisible() ? "Visible" : "Off" );
+}
+
+/*********************************************************************/
+// message for Shadow box
+LightComponent.prototype.constructShadowString = function() {
+	var message = "No Shadow                                                                        ";
+	if( LP_getShadowType( this.thisLight ) > 0 ) {
+		message = "Shadow"; 	}
+	return message;
+}
+
+/*********************************************************************/
+// Actions driven by user interface mouse clicks (usually)
+// sequence of simple set value functions triggered by user action
+//LightComponent.prototype.setColorVal = function( nValue ) {
+//	if( this.thisLight.inherits( "DzDistantLight" ) ) { // standard DAZ light
+//		this.thisLight.getDiffuseColorControl().setColorValue( nValue );
+//	}
+//	else { //for shader based lights
+//		this.thisLight.getColorControl().setColorValue( nValue );
+//	}
+//}
+LightComponent.prototype.setColorVal = function( nValue ) {
+	LP_setColor( this.thisLight, nValue ) // deals with Dz based lights and shader lights
+}
+
+
+/*********************************************************************/
+// Actions driven by user interface mouse clicks (usually)
+// sequence of simple set value functions triggered by user action
+/*LightComponent.prototype.getColorVal = function() {
+	if( this.thisLight.inherits( "DzDistantLight" ) ) { // standard DAZ light
+		return(this.thisLight.getDiffuseColorControl().getColorValue());
+	}
+	else { //for shader based lights
+		return(this.thisLight.getColorControl().getColorValue( nValue ));
+	}
+} */
+
+
+/*********************************************************************/
+LightComponent.prototype.setIntensityVal = function( nValue ) {
+	// this function is the same for DAZ default and shader based lights
+	LP_setIntensity( this.thisLight, nValue );
+	// also record this as new user-set value (assuming command did not come from live scale slider)
+	if( !bIgnoreChange ) {
+		this.nOrigIntensity = LP_getIntensity( this.thisLight );
+	}
+}
+
+/*********************************************************************/
+LightComponent.prototype.setSpreadAngle = function( nValue ) { // standard DAZ light
+	this.thisLight.getSpreadAngleControl().setValue( nValue );
+}
+
+/*********************************************************************/
+LightComponent.prototype.setBiasVal = function( nValue ) { // standard DAZ light
+	this.thisLight.getShadowBiasControl().setValue( nValue );
+}
+
+/*********************************************************************/
+LightComponent.prototype.setSoftVal = function( nValue ) { // standard DAZ light
+	this.thisLight.getShadowSoftnessControl().setValue( nValue );
+}
+
+/*********************************************************************/
+LightComponent.prototype.setShadowType = function( state ) {
+	// is it Off or one of the enumerated types  ( 1=Deep Shadow Map or 2=Raytaced)
+	this.thisLight.getShadowTypeControl().setValue( state );
+	if( state == 0 ) 	{ // I.e. User chose No shadow
+     // disable the inactive controls
+		if( this.thisLight.inherits( "DzDistantLight" ) ) {
+			this.wBiasSlider.enabled = false;
+			this.wSoftSlider.enabled = false;
+		}	}
+	else { // User chose Shadow
+		if( this.thisLight.inherits( "DzDistantLight" ) ) {
+			this.wBiasSlider.enabled = true;
+			this.wSoftSlider.enabled = true;
+		}
+	}
+	// update the global display and messages
+	setMap_RayRadioBtn();
+	this.wLightTopHBox.title = this.constructStatusString();
+	this.wShadowHBox.title = this.constructShadowString();
+}
+
+/*********************************************************************/
+LightComponent.prototype.setLightType = function( state ) { // standard DAZ light
+	// is it Off or one of the enumerated types  ( specular, diffuse, ON)
+	LP_setIlluminationControl( this.thisLight, state );
+	if( state == 0 ) 	{ // I.e. User chose Off
+		this.wLightColor.enabled = false;
+		this.wIntensitySlider.enabled = false;
+		this.wLightColor.enabled = false;
+		if( this.thisLight.className() == "DzSpotLight" ) {
+			this.wSpreadSlider.enabled = false;
+		}	}
+	else { // I.e. User turned light On
+		this.wLightColor.enabled = true;
+		this.wIntensitySlider.enabled = true;
+		this.wLightColor.enabled = true;
+		if( this.thisLight.className() == "DzSpotLight" ) {
+			this.wSpreadSlider.enabled = true;
+		}	}
+	// update the status message
+	this.wLightTopHBox.title = this.constructStatusString();
+}
+
+/*********************************************************************/
+LightComponent.prototype.setGroup = function( state ) {
+	// set group to selected. Light can only be in one group.
+	var GroupId = this.thisLight.findProperty( "LP_groupid" );
+	var sLastGroup = false;
+	if( GroupId ) 	{ // if property set then remember last and set to new id
+		sLastGroup = GroupId.getValue();  // may need to know this to update text in Global panel
+		GroupId.setValue( state );
+	}
+	else { // no group yet. So assign the state as groupid
+	   // assign it
+		GroupId = new DzIntProperty( "LP_groupid", false, true, state );
+		GroupId.setHidden( true );
+		this.thisLight.addProperty( GroupId );
+	}
+   // We may have added this light to the currently selected group in the Global panel
+	// If we have then we would want it to show an accurate number of lights in this group
+	// first check to see if widget exists yet. if not then skip (implies new light and dialog not run before)
+	if( typeof ( wGroupComboBox ) != "number" ) {
+		if( wGroupComboBox.currentItem != 0 ) {  // I.e. the ALL selection
+			if( state + 1 == wGroupComboBox.currentItem ) { // then this group is shown in UI so need to redraw the number of lights
+				setActiveGroup( state + 1 ); // simplest way is just to recalc.
+			}
+			else { // or the light may have been removed from the currently visible list and so also need an update.
+				if( sLastGroup && ( ( sLastGroup + 1 ) == wGroupComboBox.currentItem ) ) {
+					setActiveGroup( sLastGroup + 1 );
+				} 	}
+		}
+	}
+}
+
+/*********************************************************************/
+LightComponent.prototype.turnOnOff = function( state ) {
+	// Manual Light visibility control 
+	//MessageBox.critical("changed "+state, "LP debug","Ok");
+	if( state == 0 ) {
+		this.thisLight.setVisible( false );
+		this.wLightVisOnOff.checked = false;
+	}
+	else {
+		this.thisLight.setVisible( true );
+		this.wLightVisOnOff.checked = true;
+	}
+  // update the Label
+	this.wLightVisOnOff.text = this.constructVisibleString();
+	// check if this has changed the Global visibility setting
+	setVisibilityRadioBtn();
+}
+
+/*********************************************************************/
+// make camera look from lights POV
+LightComponent.prototype.lookFrom = function( nValue ) {
+	oViewPort.setCamera( this.thisLight );
+}
+
+/*********************************************************************/
+// toggle light between garish ID color and its own color
+LightComponent.prototype.swapIDColor = function( state ) {
+	if( state == 0 ) 	{ // its on so turn it off and put main color back
+     // get original color from property and put it back onto Light
+		var LightProp = this.thisLight.findProperty( "LP_properColor" );
+		if( LightProp ) {
+			var newcol = LightProp.getColorValue();
+			this.thisLight.removeProperty( "LP_properColor" );
+			this.thisLight.removeProperty( "LP_IDon" );
+			this.wIDcolor.value = this.wLightColor.value;
+			this.setColorVal( newcol );
+			//this.thisLight.setColorVal( newcol );
+			this.wLightColor.value = newcol;  // show color in widget
+		}	}
+	else { // its off so turn it on and put Garish ID color into Light color
+     // store original color in property
+		var LightProp = new DzColorProperty( "LP_properColor", false, true);
+		LightProp.setColorValue(this.wLightColor.value);
+		LightProp.setLabel( "Proper Color of Light" );
+		LightProp.setHidden( true );
+		this.thisLight.addProperty( LightProp );
+		this.setColorVal( this.wIDcolor.value ); // set light color to be the ID color
+		this.wLightColor.value = this.wIDcolor.value; // show color in widget
+		var GarishProp = new DzIntProperty( "LP_IDon", false, true, 0 );
+		GarishProp.setHidden( true );
+		this.thisLight.addProperty( GarishProp ); // only stores value 0
+	}
+}
+
+/*********************************************************************/
+LightComponent.prototype.setIDColor = function( color ) {
+	var LightProp = this.thisLight.findProperty( "LP_idColor" );
+	if( LightProp ) { // record new hilight color
+		LightProp.setColorValue( color );
+		if( this.thisLight.findProperty( "LP_IDon" ) ) 	{ // also fill in main color
+			this.setColorVal( color );
+		} 	}
+	else { // no property yet
+		var LightProp = new DzColorProperty( "LP_idColor", false, true);
+		LightProp.setColorValue(color);
+		LightProp.setLabel("Hilight color of Light");
+		LightProp.setHidden( true );
+		this.thisLight.addProperty( LightProp );
+	}
+}
+
+/*********************************************************************/
+// Add the predefined Group Names to this light's Group Combo Box
+LightComponent.prototype.addGroups = function( wComboBox ) {
+	for( var i = 0; i < groupNames.length; i++ ) {
+		wComboBox.insertItem( groupNames[ i ] );
+	}
+}
+
+/***********************************************************************
+***** LightPanelTab Prototype *****
+***********************************************************************/
+// The tabs hold N lights each. Can be many tabs.
+// The number of lights per tab is controlled by: maxLightsPerTab variable  (defined at top of file)
+function LightPanelTab( parent, name ) {
+	// Instance Members
+	this.Tab;
+
+   //constructor
+	this.Tab = new DzVGroupBox( parent );
+	parent.addTab( this.Tab, name );
+	this.Tab.insideMargin = 0;
+	this.Tab.insideSpacing = 0;
+}
+
+/***********************************************************************/
+LightPanelTab.superclass = Object;
+
+/***********************************************************************/
+// Functions in general use in the Panel
+
+//  Sorting the lights for the Tabs
+// match the first non alpha that is a digit in a string
+//var regexpNumber = new RegExp( "([A-Z]+\w)=(\\d+)" );
+// Match the first number in the name
+var regexpNumber = new RegExp( "\\d" ); // just find the first number in the name
+
+// Sort the lights
+//   Group the lights by type - then order them alphabetically
+function bubbleSort( inputArray ) {
+	var tempValue, a_name, b_name, a_stubend, b_stubend, a_endindx, b_endindx;
+	for( var i = inputArray.length - 1; i >= 0; i-- ) {
+		for( var j = 1; j <= i; j++ ) {
+			a_name = inputArray[ j - 1 ].getLabel();
+			b_name = inputArray[ j ].getLabel();
+			a_stubend = a_name.find( regexpNumber );
+			b_stubend = b_name.find( regexpNumber );
+			a_endindx = 1;
+			b_endindx = 1;
+			if( a_stubend > -1 ) {
+				a_endindx = parseInt( a_name.substring( a_stubend - 1, a_name.length ) );
+				a_name = a_name.left( a_stubend );
+			}
+			if( b_stubend > -1 ) {
+				b_endindx = parseInt( b_name.substring( b_stubend - 1, b_name.length ) );
+				b_name = b_name.left( b_stubend );
+			}
+			if( ( a_name > b_name ) || ( ( a_name == b_name ) && ( a_endindx > b_endindx ) ) ) {
+				tempValue = inputArray[ j - 1 ];
+				inputArray[ j - 1 ] = inputArray[ j ];
+				inputArray[ j ] = tempValue;
+			} 	}	}
+	return inputArray;
+}
+// unused insertion sort if bubble was slow
+function insertionSort( inputArray ) {
+	var j, index;
+	for( var i = 1; i < inputArray.length; i++ ) {
+		index = inputArray[ i ];
+		j = i;
+		while( j > 0 && ( inputArray[ j - 1 ].getLabel() > index.getLabel() ) ) 	{
+			inputArray[ j ] = inputArray[ j - 1 ];
+			j = j - 1;
+		}
+		inputArray[ j ] = index;
+	}
+	return inputArray;
+}
+
+//----------------------------------------------------------------------
+//  setting the camera
+function selectPrincipleCamera( nValue ) {
+	if( typeof ( nValue ) == "string" ) {
+		sPrincipleCamera = nValue;
+	}
+	oViewPort.setCamera( Scene.findCameraByLabel( sPrincipleCamera ) );
+}
+
+//----------------------------------------------------------------------
+// push Global light color into all lights in current Group
+function pushColor( state ) {
+	// if called then user clicked button (momentary) to copy Newcolor to all diffuse colors in current group
+	var newcol = wNewcolor.value;
+	for( var i = 0; i < guiElements.length; i++ ) {
+		lightcontrol = guiElements[ i ];
+		lightId = aActiveLights.find( lightcontrol.thisLight );
+		if( lightId != -1 ) { // i.e. the light is in the Group
+			LP_setColor( aActiveLights[ lightId ], newcol );
+			lightcontrol.wLightColor.value = newcol;
+		}
+	}
+}
+
+//----------------------------------------------------------------------
+// toggle visibility for groups
+function toggleGroupedLights( state ) {
+	var lightcontrol, lightId;
+	if( !bIgnoreChange ) {
+		//loop over all the lights in the GUI 
+	  //MessageBox.critical("active lights = "+aActiveLights.length+" "+aActiveLights, "LP debug","Ok");
+		for( var i = 0; i < guiElements.length; i++ ) {
+			lightcontrol = guiElements[ i ];
+			lightId = aActiveLights.find( lightcontrol.thisLight );
+			//if light is in the selected Group then set its GUI control and state 
+			if( lightId != -1 ) {
+				//MessageBox.critical("light = "+lightId+" "+lightcontrol.thisLight, "LP debug","Ok");
+				lightcontrol.wLightVisOnOff.checked = state;
+			}
+		}
+	}
+}
+
+// what is the visibility state of the Current Group
+function bGroupLightsVisible() {
+	var lights = aActiveLights;
+	var bChange = false;
+	var bState = "None";
+	if( lights.length != 0 ) {
+		bState = lights[ 0 ].isVisible(); // first light on/off
+		// loop through the rest and see if the same as first
+		for( var i = 1; i < lights.length; i++ ) {
+			if( bState != lights[ i ].isVisible() ) {
+				bChange = true;
+			} 	} 	}
+	return bChange ? "None" : bState;
+}
+
+// set the visibility Radio button group based on current Group
+//  On if all on. Off if all off.   Neither if lights in the group are mixed on and off.
+function setVisibilityRadioBtn() {
+	var bGroupOnOff = bGroupLightsVisible();
+	bIgnoreChange = true;
+	if( bGroupOnOff != "None" ) { // None, true or false
+		if( bGroupOnOff ) {
+			wBtn1.checked = true;
+			wBtn2.checked = false;
+		}
+		else {
+			wBtn2.checked = true;
+			wBtn1.checked = false;
+		}	}
+	else {
+		wBtn1.checked = false;
+		wBtn2.checked = false;
+	}
+	bIgnoreChange = false;
+}
+
+//----------------------------------------------------------------------
+// toggle shadow render type for groups
+function toggleMap_RayLights( state ) {
+	var lightcontrol, lightId;
+	if( !bIgnoreChange ) {
+		//loop over all the lights in the GUI 
+	  //MessageBox.critical("active lights = "+aActiveLights.length+" "+aActiveLights, "LP debug","Ok");
+		for( var i = 0; i < guiElements.length; i++ ) {
+			lightcontrol = guiElements[ i ];
+			lightId = aActiveLights.find( lightcontrol.thisLight );
+			//if light is in the selected Group then set its GUI control and state 
+			if( lightId != -1 ) {
+				if( state == true )	state = 1;
+				else state = 2;
+				lightcontrol.wShadowTypeComboBox.currentItem = state;
+				lightcontrol.thisLight.getShadowTypeControl().setValue( state );
+			}
+		}
+	}
+}
+
+// what is the visibility state of the Current Group
+function bGroupLightsshadowtypes() {
+	// if all of the lights in the active group are on or off then return that value
+	var lights = aActiveLights;
+	var bChange = false;
+	var bState = 0; // Off  (1 =Mapped, 2 = Ray)
+	if( lights.length != 0 ) {
+		bState = LP_getShadowType( lights[ 0 ] ); // first light on/off
+   	// loop through the rest and see if the same as first
+		for( var i = 1; i < lights.length; i++ ) {
+			//MessageBox.critical("lightn = "+lights[i].isVisible(), "LP debug","Ok");
+			if( bState != LP_getShadowType( lights[ i ] ) ) {
+				bChange = true;
+			}
+		}
+	}
+	//MessageBox.critical("same = "+bState, "LP debug","Ok");
+	return bChange ? -1 : bState; // -1 means no complete match in group
+}
+
+// toggle shadow render type for group (map or ray)
+//  Map  if all shadow mapped. Ray if all Raytraced.   Neither if lights in the group are mixed.
+function setMap_RayRadioBtn() {
+	var bGroupMapRay = bGroupLightsshadowtypes();
+	bIgnoreChange = true;
+	if( bGroupMapRay > 0 ) { // No match, or all off
+		if( bGroupMapRay == 1 ) { // all mapped
+			wBtn3.checked = true;
+			wBtn4.checked = false;
+		}
+		else { // all raytraced
+			wBtn4.checked = true;
+			wBtn3.checked = false;
+		} 	}
+	else { // show neither as not all match
+		wBtn3.checked = false;
+		wBtn4.checked = false;
+	}
+	bIgnoreChange = false;
+}
+
+//----------------------------------------------------------------------
+// Global Group control
+
+function setActiveGroup( nValue ) {
+	// set the active light list to be the lights in the group selected in combo Box
+	aActiveLights = aLights; // assume "ALL"
+	if( nValue != 0 ) { // all lights selected
+		// nValue -1 is the groupid. find all lights with this groupid set
+		var temp = [  ];
+		nValue -= 1;
+		for( var i = 0; i < aActiveLights.length; i++ ) {
+			var olightProp = aActiveLights[ i ].findProperty( "LP_groupid" );
+			if( olightProp ) {
+				//MessageBox.critical("light = "+lightid+" prop:"+olightProp.getValue(), "LP debug","Ok")
+				if( olightProp.getValue() == nValue ) {
+					temp.push( aActiveLights[ i ] );
+				}
+			}
+		}
+		aActiveLights = temp; // replace with just lights in selected group
+	}
+	// report results
+	wGroupSize.text = "(" + aActiveLights.length + ")"; // report on size of group when selected
+	setVisibilityRadioBtn();
+	setMap_RayRadioBtn();
+	// reset the intensity slider ?
+	resetScale();
+}
+
+//Extra function on Mouse highlight (rollover) on combo box.
+// record the last group because it will be gone when we select it
+//   (We want to set Original intensity of the last group adjusted using the slider.)
+function rememberCurrentGroup( groupId ) {
+	lastGroup = wGroupComboBox.currentItem;
+}
+
+
+//----------------------------------------------------------------------
+// function for allowing intensity adjustment of all lights in a Group
+function scaleLights( nValue ) {
+	var lightcontrol, newValue;
+	if( !bIgnoreChange ) {
+		for( var i = 0; i < guiElements.length; i++ ) {
+			lightcontrol = guiElements[ i ];
+			lightId = aActiveLights.find( lightcontrol.thisLight ); // find it
+	    // if light is active then adjust it
+			if( lightId != -1 ) {
+				if( ( ( aActiveLights[ lightId ].inherits( "DzDistantLight" ) ) && ( lightcontrol.wLightTypeComboBox.currentItem != 0 ) ) || ( ( aActiveLights[ lightId ].inherits( "DzShaderLight" ) ) ) ) 				{
+					// calculate new value from original
+					newValue = lightcontrol.nOrigIntensity * wIntensityScaleSlider.value;
+					// ignore change when doing it from here or it will creep :-)
+					bIgnoreChange = true;
+					lightcontrol.wIntensitySlider.value = newValue; // the intensity slider in each light control
+					bIgnoreChange = false;
+				} 	}
+		}
+	}
+}
+
+// Save the previously adjusted values as original intensity.
+// Reset the slider to 100 %
+function resetScale() {
+	bIgnoreChange = true;
+	var changeAll = false;
+	// old group is defined by lastGroup var
+  //MessageBox.critical("lastgroup"+lastGroup, "LP debug","Ok")
+	if( lastGroup == 0 ) { // change for all lights (virtual group)
+		changeAll = true;
+	}
+	for( var i = 0; i < guiElements.length; i++ ) {
+		var lightcontrol = guiElements[ i ];
+		if( changeAll || ( lightcontrol.thisLight.findProperty( "LP_groupid" ).getValue() == lastGroup - 1 ) ) {
+			lightcontrol.nOrigIntensity = LP_getIntensity( lightcontrol.thisLight );
+		}
+	}
+	// reset slider position
+	wIntensityScaleSlider.value = 1; // the global intensity slider
+	bIgnoreChange = false;
+}
+
+//----------------------------------------------------------------------
+// shadow toggling functions
+function bShadowRemembered() {
+	// are there 'any' prexisting settings on the lights for our property ?
+	var lights = aActiveLights;
+	var banyProps = false;
+	for( var i = 0; i < aActiveLights.length; i++ ) {
+		// loop through them all and mark any success as success
+		if( aActiveLights[ i ].findProperty( "LP_PrevShadowSetting" ) ) {
+			banyProps = true;
+		} }
+	//MessageBox.critical("found prevshadow setting = "+banyProps, "LP debug","Ok")
+	return banyProps;
+}
+
+// for all lights in scene - toggle shadow settings
+function toggleShadows() {
+	//  If  a light has a value then we must have toggled it off before (because we clear when we toggle off)
+  //     1 . do any lights have a property - if so then we will be restoring those values (and removing the property)
+  //     2. if not then we will be remembering the current values on all lights and switching them off 
+	var lights = aActiveLights;
+	var lightcontrol, currLight, LightProp;
+	var anyProps = false;
+	// do we have any existing remembered settings ?
+	if( bShadowRemembered() ) { // we need to restore all stored values (that have been set) to shadowType slot
+		for( var i = 0; i < guiElements.length; i++ ) {
+			lightcontrol = guiElements[ i ];
+			currLight = lightcontrol.thisLight;
+			LightProp = currLight.findProperty( "LP_PrevShadowSetting" );
+			if( LightProp ) { // don't do anything if no remembered value
+				prev_state = LightProp.getValue();
+				currLight.getShadowTypeControl().setValue( prev_state );
+				lightcontrol.wShadowTypeComboBox.currentItem = prev_state;
+				// clean off our remembered state - its been restored
+				currLight.removeProperty( LightProp );
+			}
+		}
+	}
+	else { // nothing remembered already so - store the current shadowType for later use
+		for( var i = 0; i < guiElements.length; i++ ) {
+			lightcontrol = guiElements[ i ];
+			currLight = lightcontrol.thisLight;
+			LightProp = currLight.findProperty( "LP_PrevShadowSetting" );
+			if( !LightProp ) { // property does not exist yet - so make it
+				LightProp = new DzIntProperty( "LP_PrevShadowSetting", false, true, LP_getShadowType( currLight ) );
+				LightProp.setHidden( true ); // so does not show on Parameters tab
+				currLight.addProperty( LightProp );
+			}
+			else { // prop already there - not sure why, so - store the value
+				LightProp.setValue( LP_getShadowType( currLight ) );
+			}
+			// stored so - now turn it off
+			currLight.getShadowTypeControl().setValue( 0 );
+			lightcontrol.wShadowTypeComboBox.currentItem = 0;
+		}
+	}
+}
+
+//--------------------------------------------------------------------------
+// Support functions for cancelling any changes
+
+function rememberLight( Light ) {
+	var spread = -1; // dummy for non Spotlights
+	var soft = -1;   // dummy for PointLights
+	var bias = -1;   // dummy for regular Lights
+	var illum = -1;  // dummy for regular Lights
+	var IDcolor = false;
+	var propercolor = false;
+	var activeID = false;
+	// properties we added
+	if( Light.findProperty( "LP_idColor" ) ) { // light has a hilight color defined
+		IDcolor = Light.findProperty( "LP_idColor" ).getColorValue();
+	}
+	if( Light.findProperty( "LP_properColor" ) ) { // light has a remembered true color
+		propercolor = Light.findProperty( "LP_properColor" ).getColorValue(); 	}
+	if( Light.findProperty( "LP_IDon" ) ) {
+		activeID = true; 	}
+	intensity = LP_getIntensity( Light );
+	illum = LP_getIlluminationControl( Light );
+	// properties of default DAZ lights
+	if( Light.inherits( "DzDistantLight" ) ) {
+		soft = Light.getShadowSoftnessControl().getValue();
+		bias = Light.getShadowBiasControl().getValue();
+	}
+	if( Light.className() == "DzSpotLight" ) {
+		spread = Light.getSpreadAngleControl().getValue();
+	}
+	// properties of other kinds of lights
+  //    MessageBox.critical("Saving "+Light.isVisible(), "LP Debug","Ok");
+  //
+	originalLightdata.push( new Array( Light,
+	               LP_getColor(Light), //.getDiffuseColor(),
+	               LP_getShadowType( Light ),
+	               illum, intensity,
+	               bias, soft, spread, Light.isVisible(),
+	               // our (LP) properties
+	               IDcolor, propercolor, activeID
+	               // other special light shader  properties
+                  ) );
+}
+
+// stick the saved Light settings back into the lights (I.e. user cancelled)
+function restoreOriginalLightSettings() {
+	var data, Light;
+	for( var i = 0; i < originalLightdata.length; i++ ) {
+		data = originalLightdata[ i ];
+		//MessageBox.critical("Restoring "+i+"\n"+data, "LP Debug","Ok");
+		Light = data[ 0 ];
+		LP_setColor(Light, data[ 1 ] );
+		//if( Light.inherits( "DzDistantLight" ) ) {
+		//	Light.getDiffuseColorControl().setColorValue( data[ 1 ] ); 	}
+		//else {
+		//	Light.getColorControl().setColorValue( data[ 1 ] ); 		}
+		if( data[ 2 ] != -1 ) 	{
+			Light.getShadowTypeControl().setValue( data[ 2 ] ); 		}
+		if( data[ 3 ] != -1 ) 	{  // some Dzshader lights have special handling
+			LP_setIlluminationControl( Light, data[ 3 ] ); 		}
+		LP_setIntensity( Light, data[ 4 ] );
+		if( data[ 5 ] != -1 ) {
+			Light.getShadowBiasControl().setValue( data[ 5 ] ); 		}
+		if( data[ 6 ] != -1 ) 	{
+			Light.getShadowSoftnessControl().setValue( data[ 6 ] ); 		}
+		if( data[ 7 ] != -1 ) 	{
+			Light.getSpreadAngleControl().setValue( data[ 7 ] ); 		}
+		Light.setVisible( data[ 8 ] );
+		Light.removeProperty( "LP_idColor" );
+		if( data[ 9 ] ) {
+			var idcolor = new DzColorProperty( "LP_idColor", false, true); //, data[ 9 ] );
+			idcolor.setColorValue(data[9]);
+			idcolor.setHidden( true );
+			Light.addProperty( idcolor );
+		}
+		Light.removeProperty( "LP_properColor" );
+		if( data[ 10 ] ) 	{
+			var propcolor = new DzColorProperty( "LP_properColor", false, true); //, data[ 10 ] );
+			propcolor.setColorValue(data[10]);
+			propcolor.setHidden( true );
+			Light.addProperty( propcolor );
+		}
+		Light.removeProperty( "LP_IDon" );
+		if( data[ 11 ] ) {
+			var idstate = new DzIntProperty( "LP_IDon", false, true, 0 );
+			idstate.setHidden( true );
+			Light.addProperty( idstate );
+		}
+		// other light properties
+		
+	}
+}
+
+// given a list of items - return an array of them grouped by similarity
+function groupitems( collection ) {
+	var i = 0;
+	var newitem;
+	var j = 0;
+	var colgrp = new Array;
+	for( var i = 0; i < collection.length; i++ ) {
+		colgrp[ i ] = new Array( [ i ] );
+	}
+	//MessageBox.critical("start col "+collection, "LP Debug","Ok");
+	var alldone = collection.length > 0 ? false : true;
+	var lookdone = false;
+	var skipthese = [];
+	while( !alldone ) {
+		thisitem = collection[ i ];
+		//MessageBox.critical("starting on i= "+i,"LP Debug","Ok");
+		j = i + 1;
+		while( !lookdone ) {
+			while( skipthese.find( j ) != -1 ) {
+				j++; }
+			if( j >= collection.length ) { // are we done for this pass yet ?
+				lookdone = true;
+			}
+			else { // test to see if a match
+				newitem = collection[ j ];
+				if( thisitem == newitem ) { // found a match
+					skipthese.push( j );
+					colgrp[ i ].push( j );
+				}
+				j++;
+				if( j >= collection.length ) { // are we done for this pass yet ?
+					lookdone = true;       		}
+			}	}
+		//MessageBox.critical("finished i= "+i,"LP Debug","Ok");
+		j = 0; 	i++;	lookdone = false; // reset values for next trip through the loop
+		while( skipthese.find( i ) != -1 ) { 
+			i++; } // skip the ones we already matched
+		if( i >= collection.length ) {
+			alldone = true;
+		}
+	}
+	// should have array of howmany matches for lights where index is into collection array
+  //MessageBox.critical("Grouping data\n"+colgrp.join(":"), "LP Debug","Ok");
+	return ( colgrp );
+}
+
+
+function SetLightGroups( lights ) {
+	// we want to place the lights into useful groupings.
+  // such as - same color, same intensity, shadowed lights, similar names, etc
+  // So we order these in prefered order - then loop through lights looking for groups that light might be in.
+  // so each light may end up in several groups. Then we traverse groups finding most common and make that the final grouping
+	var col = new Array;
+	var intens = new Array;
+	var shad = new Array;
+	var allocated = new Array;
+	var groups = new Array;
+	// gather the useful aspects of the lights
+	for( var i = 0; i < lights.length; i++ ) {
+		light = lights[ i ];
+		col[ i ] = LP_getColor(light).rgb; //.getDiffuseColor().rgb;
+		intens[ i ] = LP_getIntensity( light );
+		shad[ i ] = LP_getShadowType( light );
+	}
+	// find the groups
+	var minGroupSize = 2;
+	var colors = simplifyGroups( groupitems( col ), minGroupSize );
+	var colorrem = colors[ 1 ];
+	colors = colors[ 0 ];
+	var intensities = simplifyGroups( groupitems( intens ), minGroupSize );
+	var intenrem = intensities[ 1 ];
+	intensities = intensities[ 0 ];
+	var shadows = groupitems( shad );
+	// Make groups
+  // Once an item is assigned to a group - it cannot be assigned again
+  // priority is colors, intensities, shadow types
+  // start by grouping on most important feature - colors
+  //  - then gather the groups over 3 in size
+  //  - now group within these groups by - intensity
+  //  at the same time items that did not group by color are also checked ofr intensity (as an isolated task)
+  // keep recursing down until all important aspects are grouped.
+  //  MessageBox.critical("simplified groups =  \n"+colors.join(":")+"\n"+colorrem,"LP Debug","Ok");
+  // now we have initial color based grouups
+  // iterate through these groups looking to subgroup by intensity
+  // MessageBox.critical("Intensities  =  \n"+intensities.join(":")+"\n"+intenrem,"LP Debug","Ok");
+  // loop through the groups looking for subgroups
+  // if we loop through all items in intensity group and find that more than n members are in the same color group - then we split the color group into two
+  //    for (var i=0; i< intensities.length; i++)  { //for each intensity group
+  //	if  (intensities[i].length > minGroupSize)  { // ignore trival group cases - cannot get more groups out of 2 elements
+  //	for (var idx=0; idx< intensities[i].length; idx++) { //for each element in that group
+  //	    colidx = colors.find(intensities[i][idx]
+   
+  // make the groups up
+	var grpid = 1; // global count from here
+	for( var i = 0; i < colors.length; i++ ) {
+		if( colors[ i ].length > 1 ) 	{
+			//MessageBox.critical("group of "+colors[i]+" "+grpid, "LP Debug","Ok");
+			for( j = 0; j < colors[ i ].length; j++ )
+			{
+				LP_setGroup( lights[ colors[ i ][ j ] ], grpid );
+				allocated.push( colors[ i ][ j ] );
+				// for now stick with def names because we can't remember them in the scene yet !!!
+		     //groupNames[grpid] = LP_describeColor(lights[i].getDiffuseColor())+"-"+grpid;
+			}
+			grpid++;
+		}
+	}
+	// don't forget the names as group
+  //var lname = thisLight.getLabel();
+  // Look for Light Dome product lights !!! put this in a prepass over al lights assigning them to groups of similar lights
+  //	if (lname.startsWith("Ambient" )) { state = 6};
+  //	if (lname.startsWith("Sky" )) { state = 5};
+}
+
+function simplifyGroups( groups, minsize ) {
+	var principle_groups = new Array();
+	var remainder = new Array();
+	//MessageBox.critical("groups =  \n"+groups.join(":"),"LP Debug","Ok")
+	for( var i = 0; i < groups.length; i++ ) {
+		if( groups[ i ].length >= minsize ) { // collect all colors in groups >1
+			principle_groups.push( groups[ i ] );
+		}
+		else {
+			if( groups[ i ].length == 1 ) { // only collect th epossibles so initial list of remainder is not full length
+				remainder.push( i );
+			}
+		}
+	}
+	// remove all elements in groups from remainder
+	var idx = 0;
+	for( var i = 0; i < principle_groups.length; i++ ) {
+		for( var j = 0; j < principle_groups[ i ].length; j++ ) {
+			idx = remainder.find( principle_groups[ i ][ j ] );
+			if( idx != -1 ) {
+				remainder.splice( remainder.find( principle_groups[ i ][ j ] ), 1 );
+			}
+		}
+	}
+	return [ principle_groups, remainder ];
+}
+
+function LP_setGroup( light, state ){
+	// set the Group (from outside the class)
+	var GroupId = light.findProperty( "LP_groupid" );
+	// either do nothing or overwrite
+  //MessageBox.critical("Found grpid = "+GroupId+light,"LP Debug","Ok");
+	if( !GroupId ) { // no groupid assigned yet
+		GroupId = new DzIntProperty( "LP_groupid", false, true, state );
+		GroupId.setHidden( true );
+		light.addProperty( GroupId );
+	}
+	else {
+		GroupId.setValue( state );
+	}
+}
+
+// clear groupID off all lights
+function clearGroups() {
+	for( var i = 0; i < aLights.length; i++ ) {
+		currLight = aLights[ i ];
+		currLight.removeProperty( "LP_groupid" );
+	}
+}
+
+// return a string representing the nature of the light
+function LP_describeColor( color ) {
+	var hue = color.hue;
+	var sat = color.saturation;
+	var val = color.value;
+	var result = "";
+	// check for B&W and intensity
+	if( hue == -1 ) {
+		if( val == 0 ) {
+			result = "Black"; 		}
+		else {
+			if( val < 48 ) {
+				result = "Dark Gray"; 	}
+			else {
+				if( val < 150 ) {
+					result = "Mid Gray"; }
+				else {
+					if( val < 200 ) {
+						result = "Bright Gray"; }
+					else {
+						if( val == 255 ) 	{
+							result = "White"; }
+					} 	} } } }
+	// else set the verb
+	else { 
+		if( val < 20 ) {
+			result = "VDk"; }
+		else {
+			if( val < 50 ) {
+				result = "Dk"; }
+			else {
+				if( val > 200 ) {
+					result = "Brite"; }
+			} } }
+	// saturation
+	if( hue != -1 && sat < 70 )	{
+		result += "Pale"; }
+	else {
+		if( hue != -1 && sat > 180 ) {
+			result += "Sat"; 	}
+	}
+   // now set the Hue
+	if( hue > 328 ) {
+		result += " Red"; }
+	else {
+		if( hue > 254 ) {
+			result += " Pur"; }
+		else {
+			if( hue > 196 ) {
+				result += " Blu"; }
+			else {
+				if( hue > 158 ) {
+					result += " Cyn"; }
+				else {
+					if( hue > 71 ) {
+						result += " Grn"; }
+					else {
+						if( hue > 48 ) {
+							result += " Yel"; }
+						else {
+							if( hue > 13 ) {
+								result += " Orn"; }
+							else {
+								if( hue >= 0 ) {
+									result += " Red"; }
+							}	} }	}	} } } 
+	return ( result );
+}
+
+
+//--------------------------------------------------------------------------
+// Now make the LP dialog
+//--------------------------------------------------------------------------
+// Our Lighting Panel Dialog
+var wDlg = new DzDialog;
+var Tabs = new Array();//[];
+setBusyCursor();
+get_persistent_vars();
+
+// Main function for building the UI dialog
+if( App.versionString < MIN_VERSION ) {
+	MessageBox.critical( "This script needs at least D|S " + MIN_VERSION + " to run.", "Lighting Panel", "Ok" );
+}
+else {
+	// Build the pane of controls one per light - then add global controls
+	wDlg.caption = "Lighting Panel - Master Control";
+	// Main Layout
+	var wDlgLyt1 = new DzVBoxLayout( wDlg );
+	// a dummy, see next
+    //var wDlgLyt1 = new DzHBoxLayout( wDlg );
+
+	wDlgLyt1.autoAdd = true;
+	wDlgLyt1.margin = 2;
+	wDlgLyt1.spacing = 2;
+	var wdummy = new DzHGroupBox( wDlg ); // because you can't have a resizeable VBox layout (1.7, 1.8)
+	//  !!! not true - need to remove the dummy but have a margin
+	wdummy.margin = 2;
+	wdummy.spacing = 2;
+	wdummy.flat = true;
+	// Make the two groups under this.
+  //     one for global control and one for tabs of lights
+	var wGlobalVBox = new DzVGroupBox( wdummy );
+	wGlobalVBox.title = "Global controls";
+	wGlobalVBox.insideMargin = 2;
+	wGlobalVBox.insideSpacing = 8;
+	//wGlobalVBox.maxWidth = 154;
+  // Tabs on the right
+	var wTabFrame = new DzTabWidget( wdummy );
+	var TabsIndex = 0;
+	var lightCount = 0; // count when to make a new Tab    
+	var lightcontrol, currLight;
+	// var  aLights defined at head of file
+	var lights_all = Scene.getLightList();
+	// get all the lights we think we can control
+	for( var i = 0; i < lights_all.length; i++ ) {
+		var oLight = lights_all[ i ];
+		aLights.push( oLight );
+	}
+	// sort lights here before putting them on tabs
+	aLights = bubbleSort( aLights );  // OR insertionSort(aLights);
+	SetLightGroups( aLights ); // put them in Groups based on type, color, etc
+	aActiveLights = aLights;   // well need this for setting groups - default to "ALL"
+	if( aLights.length > 0 )	{ // make a tab. Give it a name based on light type
+		Tabs.push( new LightPanelTab( wTabFrame, sTrimLightName( aLights[ 0 ], 5 ) ) );	}
+	for( var i = 0; i < aLights.length; i++ ) 	{ // can't use "for i in aLights" as not in sequence order!
+		currLight = aLights[ i ];
+		// remember values for Cancel here
+		rememberLight( currLight );
+		// Make a section in the UI for controlling each light
+	  // put max lights on each tab
+		if( lightCount > maxLightsPerTab ) {
+			Tabs.push( new LightPanelTab( wTabFrame, sTrimLightName( currLight, 5 ) ) );
+			TabsIndex += 1;
+			lightCount = 0;
+		}
+		lightCount += 1;
+		// make the lighting control for that Tab
+		lightcontrol = new LightComponent( currLight, Tabs[ TabsIndex ].Tab );
+		guiElements.push( lightcontrol ); // record for globally changing such things as shadow and light intensity
+	}
+	//clearBusyCursor();
+  //MessageBox.critical("Stored "+originalLightdata.length, "LP Debug","Ok");
+  // Meanwhile back on the Left in Globals...
+  // put principle camera in its own box
+	var wGlobalVBox1 = new DzVGroupBox( wGlobalVBox );
+	wGlobalVBox1.title = "Principle Camera";
+	wGlobalVBox1.insideMargin = 4;
+	wGlobalVBox1.insideSpacing = 2;
+	
+	// Choose camera View to be primary
+	var cameras = Scene.getCameraList();
+	var sCurrentCamera = oViewPort.getCamera().getLabel(); // !!! should make sure not looking at lights. so switch to first camera in list if string not match
+	sPrincipleCamera = sCurrentCamera;
+	var wCameraComboBox = new DzComboBox( wGlobalVBox1 );
+	// add Perspective camera to list (prepend) !!!
+  //var oPerspectiveCam = Scene.findCamera("Perspective View")    
+  //wCameraComboBox.insertItem( oPerspectiveCam )
+	var cname, cindex;
+	for( var i = 0; i < cameras.length; i++ ) 	{ // add the non-view cameras
+		cname = cameras[ i ].getLabel();
+		if( cname == sCurrentCamera ) {
+			cindex = i;
+		}
+		wCameraComboBox.insertItem( cname );
+	}
+	wCameraComboBox.setFixedWidth( 128 );
+	wCameraComboBox.currentItem = cindex;
+	wCameraComboBox.toolTip = "Choose principle camera";
+	wCameraComboBox.whatsThis = "Choose a Camera from the Scene";
+	// hook it up 
+	connect( wCameraComboBox, "activated(const QString&)", selectPrincipleCamera );
+	
+	// Toggle control for selecting Principle camera
+	wPrincipleCameraToggle = new DzPushButton( wGlobalVBox1 );
+	wPrincipleCameraToggle.setFixedWidth( 48 );
+	wPrincipleCameraToggle.text = "View";
+	wPrincipleCameraToggle.toolTip = "Look at scene from this Camera";
+	wPrincipleCameraToggle.whatsThis = "Set Current Viewport to this Camera";
+	connect( wPrincipleCameraToggle, "pressed()", selectPrincipleCamera ); // function to call when user interacts
+
+	// Toggle control for shadows
+	var wshadowToggle = new DzCheckBox( wGlobalVBox );
+	wshadowToggle.setFixedWidth( 140 );
+	wshadowToggle.text = "All Shadows Off";
+	wshadowToggle.checked = bShadowRemembered();
+	wshadowToggle.whatsThis = "Toggle shadows on/off for all lights (remembering previous setting) (Thanks Guandalug)";
+	connect( wshadowToggle, "toggled(bool)", toggleShadows ); // function to call when user interacts
+	// put group controls in their own box
+	var wGlobalVBox2 = new DzVGroupBox( wGlobalVBox );
+	wGlobalVBox2.title = "Group Controls";
+	wGlobalVBox2.insideMargin = 2;
+	wGlobalVBox2.insideSpacing = 2;
+	
+	// subgroup where user selects All or a Group by name
+	var wGlobalHBox2a = new DzHGroupBox( wGlobalVBox2 );
+	wGlobalHBox2a.insideMargin = 2;
+	wGlobalHBox2a.insideSpacing = 2;
+	wGlobalHBox2a.flat = true;
+	
+	// Select Group
+  //var wGroupText = new DzLabel(wGlobalHBox2a);
+  //wGroupText.text = "Group";
+	wGroupComboBox = new DzComboBox( wGlobalHBox2a );
+	wGroupComboBox.setFixedWidth( 92 );
+	// add "All" to head of list and make it the default
+	wGroupComboBox.insertItem( "All Lights" );
+	wGroupComboBox.currentItem = 0; // i.e. All
+	for( var i = 0; i < groupNames.length; i++ ) {
+		wGroupComboBox.insertItem( groupNames[ i ] );
+	}
+	wGroupComboBox.whatsThis = "Only Lights in this group will be affected";
+	// this index will now be off by one :-) (because added All)
+	wGroupSize = new DzLabel( wGlobalHBox2a );
+	wGroupSize.alignment = 8;//DzWidget:AlignCenter;
+	wGroupSize.text = "(" + aLights.length + ")";
+	wGroupSize.whatsThis = "How many lights are in this group";
+	connect( wGroupComboBox, "activated(int)", setActiveGroup ); // function to call when user interacts
+	connect( wGroupComboBox, "highlighted(int)", rememberCurrentGroup ); // also remember the current group for setting original intensity
+	
+	// Create intensity slider for Groups of Lights
+	wIntensityScaleSlider = new DzFloatSlider( wGlobalVBox2 );
+	wIntensityScaleSlider.label = "Intensity";
+	wIntensityScaleSlider.labelVisible = true;
+	wIntensityScaleSlider.min = 0;
+	wIntensityScaleSlider.max = 3;
+	wIntensityScaleSlider.clamped = true;
+	wIntensityScaleSlider.sensitivity = 0.1;
+	wIntensityScaleSlider.value = 1;
+	wIntensityScaleSlider.textEditable = true;
+	wIntensityScaleSlider.textVisible = true;
+	wIntensityScaleSlider.displayAsPercent = true;
+	wIntensityScaleSlider.toolTip = "Scale all Scene Lights";
+	wIntensityScaleSlider.setFixedWidth( 130 );
+	wIntensityScaleSlider.alignment = 1; //Vertical;
+	wIntensityScaleSlider.whatsThis = "Scale Intensity of lights in Group. Up to a factor of 3x";
+	connect( wIntensityScaleSlider, "valueChanged(float)", scaleLights ); // function to call when user interacts
+	
+	// add on/off for Groups of Lights
+	var wBtnGrp = new DzHButtonGroup( wGlobalVBox2 );
+	wBtnGrp.title = "Group - Lights On/Off";
+	wBtnGrp.flat = true;
+	wBtnGrp.columns = 2;
+	wBtnGrp.insideMargin = 2;
+	wBtnGrp.insideSpacing = 4;
+	wBtnGrp.checkable = false;
+	wBtnGrp.whatsThis = "Show combined status of lights in group and allow to turn on/off";
+	// Create the radio buttons
+	wBtn1 = new DzRadioButton( wBtnGrp );
+	wBtn1.text = "On";
+	wBtn1.whatsThis = "Turn all lights in Group On";
+	wBtn2 = new DzRadioButton( wBtnGrp );
+	wBtn2.text = "Off";
+	wBtn2.whatsThis = "Turn all lights in Group Off";
+	setVisibilityRadioBtn();
+	connect( wBtn1, "toggled(bool)", toggleGroupedLights ); // function to call when user interacts
+
+  // add map/ray for Groups of Lights
+	var wshadtypeGrp = new DzHButtonGroup( wGlobalVBox2 );
+	wshadtypeGrp.title = " Group - Shadow Type";
+	wshadtypeGrp.flat = true;
+	wshadtypeGrp.columns = 2;
+	wshadtypeGrp.insideMargin = 2;
+	wshadtypeGrp.insideSpacing = 4;
+	wshadtypeGrp.checkable = false;
+	wshadtypeGrp.whatsThis = "Show combined status of lights in group and allow to turn on/off";
+	// Create the radio buttons
+	wBtn3 = new DzRadioButton( wshadtypeGrp );
+	wBtn3.text = "Map";
+	wBtn3.whatsThis = "Turn all shadows to Shadow Maps";
+	wBtn4 = new DzRadioButton( wshadtypeGrp );
+	wBtn4.text = "Ray";
+	wBtn4.whatsThis = "Turn all shadows to Raytraced";
+	setMap_RayRadioBtn(); // set the buttons to reflect the initial visibility state of "All" the lights
+	connect( wBtn3, "toggled(bool)", toggleMap_RayLights ); // function to call when user interacts
+    
+  // subgroup to replace color of selected lights
+	var wColorReplaceHBox, wpushColor;
+	wColorReplaceHBox = new DzHGroupBox( wGlobalVBox2 );
+	wColorReplaceHBox.insideMargin = 2;
+	wColorReplaceHBox.insideSpacing = 2;
+	wColorReplaceHBox.flat = true;
+	wColorReplaceHBox.title = "Replace Diffuse Color";
+	wNewcolor = new DzColorWgt( wColorReplaceHBox );
+	wNewcolor.value = NewColorDefault;
+	wNewcolor.setFixedWidth( 80 );
+	wNewcolor.toolTip = "Bright Identification color (standin)";
+	wNewcolor.whatsThis = "A Garish color to make it easy to spot how this light is contributing to scene illumination";
+	wpushColor = new DzPushButton( wColorReplaceHBox );
+	wpushColor.text = "Do It";
+	wpushColor.setFixedWidth( 48 );
+	wpushColor.toolTip = "Send this Color to this Group";
+	wpushColor.whatsThis = "Copy this color into all lights in the selected Group";
+	connect( wpushColor, "pressed()", pushColor ); // function to call when user interacts
+	clearBusyCursor();
+	
+	// global LP actions
+	var wGlobals, wGlobalLabel;
+	wGlobals = new DzVGroupBox( wGlobalVBox2 );
+	wGlobals.insideMargin = 4;
+	wGlobals.title = "When Next Used:   ";
+	wGlobalLabel = new DzLabel( wGlobals );
+	wGlobalLabel.text = "Number of Lights per Tab";
+	var wLightsPerTab = new DzEnumSlider( wGlobals );
+	for( var i = 2; i < 13; i++ ) {
+		wLightsPerTab.addItem( String( i ) );
+	}
+	wLightsPerTab.value = maxLightsPerTab - 1;
+	connect( wLightsPerTab, "valueChanged(int)", set_persistent_vars );
+	// add button to inhibit Group recalc
+  //var wResetGroups;
+  //wResetGroups = new DzPushButton(wGlobals);
+  //wResetGroups.text = "Recalc Groups";
+  //connect(wResetGroups, "pressed()", clearGroups);
+
+  //--------------------------------------------------------
+  // Bottom of the Dialog
+  // Create a group box for the dialog buttons
+	var wDlgBtnsGB = new DzGroupBox( wGlobalVBox );
+	wDlgBtnsGB.flat = true;
+	
+	// Create a layout for the dialog buttons
+	var wDlgBtnsLyt = new DzGridLayout( wDlgBtnsGB );
+	wDlgBtnsLyt.margin = nMARGIN;
+	wDlgBtnsLyt.spacing = nSPACING;
+	
+	// Create the interactive help ("What's This?") push button
+	var wHelpBtn = new DzPushButton( wDlgBtnsGB );
+	wHelpBtn.pixmap = new Pixmap( String( "%1/images/icons/whatsthissmallicon.png" ).arg( App.getResourcesPath() ) );
+	wHelpBtn.maxHeight = nMAX_BTN_HEIGHT;
+	wHelpBtn.minWidth = 30;
+	if( oHelpAction )
+		connect( wHelpBtn, "clicked()", oHelpAction, "activate()" ); // function to call when user interacts
+	wHelpBtn.toolTip = oHelpMgr.getToolTip( "WhatsThis" );
+	wHelpBtn.whatsThis = oHelpMgr.getHelpString( "WhatsThis" );
+	wDlgBtnsLyt.addWidget( wHelpBtn, 1, 0 );
+	
+	// Create the accept push button
+	var wAcceptBtn = new DzPushButton( wDlgBtnsGB );
+	wAcceptBtn.text = "&Accept";
+	wAcceptBtn.maxWidth = 60;
+	wAcceptBtn.maxHeight = nMAX_BTN_HEIGHT;
+	wDlg.setAcceptButton( wAcceptBtn );
+	wAcceptBtn.toolTip = oHelpMgr.getToolTip( "AcceptDialog" );
+	wAcceptBtn.whatsThis = oHelpMgr.getHelpString( "AcceptDialog" );
+	wDlgBtnsLyt.addWidget( wAcceptBtn, 0, 1 );
+	
+	// Create the cancel push button
+	var wCancelBtn = new DzPushButton( wDlgBtnsGB );
+	wCancelBtn.text = "&Cancel";
+	wCancelBtn.maxWidth = 60;
+	wCancelBtn.maxHeight = nMAX_BTN_HEIGHT;
+	wDlg.setRejectButton( wCancelBtn );
+	wCancelBtn.toolTip = oHelpMgr.getToolTip( "CancelDialog" );
+	wCancelBtn.whatsThis = oHelpMgr.getHelpString( "CancelDialog" );
+	wDlgBtnsLyt.addWidget( wCancelBtn, 0, 0 );
+	// better cancel the changes if we click it ...
+	connect( wCancelBtn, "clicked()", restoreOriginalLightSettings ); // function to call when user interacts
+	
+	// Polish
+	//wDlg.width = wDlg.minWidth > 680 ? wDlg.minWidth : 680;
+	wDlg.width = wDlg.minWidth > 630 ? wDlg.minWidth : 630;
+	//wDlg.height = wDlg.minHeight;  // Not calculating the .flat spacing properly
+	wDlg.sizeGripEnabled = true;
+	//clearBusyCursor();
+}
+
+//------------------------------------------------------
+// Launch
+beginUndo();
+wDlg.exec();
+// Exited now so stop recording actions for the undo, and add "Light Panel" to the undo stack.
+acceptUndo( g_sTOOL_NAME );
+
+
+// Bugs:
+// - !!! principle camera is not right if enter dialog with camera set to a light.
+// - taking a light out of a current group does not change the GUI number of lights
+// group lights by similarity - name groups this way too (or leave as G1..)
+// identify function to identify and tag each shader light
+//
+
+
+
+// for pendragon's IBL light we need to deal with:
+//	setNumericProperty( "Specular Intensity", [ 1 ] );
+//	setNumericProperty( "Irradiance Shadingrate", [ 256 ] );
+//	setNumericProperty( "Irradiance MaxError", [ 0.5 ] );
+//	setNumericProperty( "IBL Brightness Scale", [ 1 ] );
+//	setColorProperty( "IBL Color Map", [ [ 255, 255, 255 ] ], "/Runtime/textures/ah/HDR_IBL_Images/ahOffice_002_lowres.tif" );
+//	setNumericProperty( "IBL Map Saturation", [ 1 ] );
+//	setNumericProperty( "AO", [ 1 ] );
+//	setNumericProperty( "AO Strength", [ 1 ] );
+//	setNumericProperty( "AO Min. Distance", [ 0.5 ] );
+//	setNumericProperty( "AO Max. Distance", [ 100000 ] );
+//	setNumericProperty( "AO Distribution", [ 0 ] );
+//             setNumericProperty( "AO Samples", [ 8 ] );
+//             setNumericProperty( "AO Samples for Transparent Materials", [ 4 ] );
+
+// for UberSpotlight with shadow:
+//		"Color",  new Color( 255, 255, 255 ),
+//		"Intensity", 0.0, 1.0, 1.0
+//		"Intensity Scale", , 0.0, 1000.0, 1.0
+//		"Spread Angle", undefined, 0.0, 180.0, 60.0
+//	"Cone Outside"
+//		"Cone Softness", 0.0, 1.0, 1.0
+//	"Light/Falloff"
+//		"Falloff Active", 0
+//		"Falloff Start", 0.0, 10000.0, 1.0
+//		"Falloff End",  0.0, 10000.0, 500.0,
+//
+//	"Light/Barndoors";
+//	["Left", "Right", "Top", "Bot"];
+//	for (var i in bdGroups) {
+//			"Barndoor "+bdGroups[i]+" Active", 0
+//			"Barndoor "+bdGroups[i]+" Angle",  0.0, 90.0, 30.0
+//			"Barndoor "+bdGroups[i]+" Softness", 0.0, 1.0, 1.0
+//	"Shadow";
+//		"Shadow Color",  new Color( 0, 0, 0 )
+//		"Shadow Intensity",, 0.0, 1.0, 1.0
+//		"Samples", 0, 128, 4
+//		"Shadow Softness", 0.0, 1.0, 0.0
+//		"Shadow Bias", 0.0, 20.0, 1.0
+
+// UberPoint
+// also has light color map = Gobo
+// also has no mapped shadow ability - ray trace only
+//	addFloatProperty( "Light/Basic", "Intensity", "intensity", 0.0, 1.0, 1, undefined, true, true, false, false, undefined, undefined);
+//	addFloatProperty( "Light/Basic", "Intensity Scale", "intensityscale", 0.0, 10.0, 1.0, undefined, false, true, false, false, undefined, undefined);
+//	addColorProperty( "Light/Basic", "Color", "lightcolor", new Color( 1, 1, 1), true, false, undefined, undefined);
+//	addBoolProperty( "Light/Falloff", "Falloff Active", "falloff_active", 1, undefined);
+//	addFloatProperty( "Light/Falloff", "Falloff Start", "falloff_start", 0.0, 1.0, 0, undefined, false, false, false, false, undefined, undefined);
+//	addFloatProperty( "Light/Falloff", "Falloff End", "falloff_end", 0.0, 1.0, 0, undefined, false, false, false, false, undefined, undefined);
+//	addFloatProperty( "Light/Falloff", "Falloff Decay", "falloff_decay", 0.1, 5.0, 2, undefined, true, false, false, false, undefined, undefined);
+//	addFloatProperty( "Shadow", "Shadow Softness", "blur", 0.0, 1.0, 0, undefined, true, true, false, false, undefined, undefined);
+//	addFloatProperty( "Shadow", "Shadow Bias", "bias", 0.0, 20.0, 1.0, undefined, true, false, false, false, undefined, undefined);
+//	addIntProperty( "Shadow", "Shadow Samples", "samples", 0.0, 128, 4, undefined, true, false, false, undefined, undefined);
+//	addColorProperty( "Shadow", "Shadow Color", "shadowcolor", new Color( 0, 0, 0), false, false, undefined, undefined);
+//	addFloatProperty( "Shadow", "Shadow Intensity", "shadowintensity", 0.0, 1.0, 1, undefined, true, true, false, false, undefined, undefined);
+
+// render to rib example shows how to save persistent var e.g. how many lights on a tab
+// also in Geometry pipeline example
