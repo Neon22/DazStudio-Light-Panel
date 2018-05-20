@@ -1791,7 +1791,7 @@ else {
 	
 	// Create the accept push button
 	var wAcceptBtn = new DzPushButton( wDlgBtnsGB );
-	wAcceptBtn.text = "&Accept";
+	wAcceptBtn.text = "Accept";
 	wAcceptBtn.maxWidth = 60;
 	wAcceptBtn.maxHeight = nMAX_BTN_HEIGHT;
 	wDlg.setAcceptButton( wAcceptBtn );
@@ -1801,7 +1801,7 @@ else {
 	
 	// Create the cancel push button
 	var wCancelBtn = new DzPushButton( wDlgBtnsGB );
-	wCancelBtn.text = "&Cancel";
+	wCancelBtn.text = "Cancel";
 	wCancelBtn.maxWidth = 60;
 	wCancelBtn.maxHeight = nMAX_BTN_HEIGHT;
 	wDlg.setRejectButton( wCancelBtn );
